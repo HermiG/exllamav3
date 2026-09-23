@@ -182,6 +182,26 @@ def test_codec_pad_rows_decode_to_zero():
         assert torch.equal(x, torch.zeros(4, D)), f"pad rows not exactly zero at K = {K}"
 
 
+
+@torch.inference_mode()
+def test_encoder_zero_rows_pack_to_zero():
+    """All-zero source rows (vocab pad slots) must PACK to all-zero words through the
+    encode chain (not just decode to zero when pre-zeroed): the group_prescale
+    empty-group guard would otherwise store a 1.0 scale and emit codebook garbage."""
+    for K in (6, 7, 8):
+        D, G = 512, 2
+        w = torch.zeros(3, D)
+        w[1] = 1.0  # nonzero neighbor stays on the normal encode path
+        packed, scale0 = et.quantize_rows_grouped(
+            w, K, D, lambda wp, k, d: torch.zeros(wp.shape[0], d, dtype = torch.int16))
+        assert torch.equal(packed[0], torch.zeros_like(packed[0])), f"zero row not zero-packed at K = {K}"
+        assert torch.equal(packed[2], torch.zeros_like(packed[2])), f"zero row not zero-packed at K = {K}"
+        assert bool((scale0[[0, 2]] == 0).all()), f"zero row scale words not zero at K = {K}"
+        assert bool((scale0[1] != 0).all()), f"nonzero row scales clobbered at K = {K}"
+        x = dequant_rows_transformed(packed[[0, 2]], torch.ones(D, dtype = torch.float16),
+                                     K, 7, D, G, row_ids = torch.tensor([5, 9999]))
+        assert torch.equal(x, torch.zeros(2, D)), f"zero-packed rows decode nonzero at K = {K}"
+
 @torch.inference_mode()
 def test_lcg_signs_prefix_consistency():
     """Sign stream for row r must be the same stream regardless of the batch it is drawn
