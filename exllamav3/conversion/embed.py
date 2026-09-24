@@ -23,6 +23,8 @@ imports this and never re-implements the encoder or codec):
         K,                           # bits per position, 4..8 (fused kernel range)
         seed = 0,                    # LCG sign-stream seed (pinned in metadata)
         key = "model.embed_tokens.weight",   # tensor key when source is a directory
+        keep_rows = None,            # optional int64 (V_out,) row filter for pruned-vocab
+                                     # runs: output row n = source row keep_rows[n]
         chunk_rows = 8192,           # rows per work chunk
         limit_rows = None,           # quantize only the first N (kept) rows (testing)
         resume = False,              # continue an interrupted run (parameters must match)
@@ -35,7 +37,11 @@ imports this and never re-implements the encoder or codec):
         verbose = True,
     ) -> dict                        # stats: rows, K, seed, encoder, rfn, sqnr_db, elapsed...
 
-Determinism: identical (source rows, K, seed, encoder, chunk_rows) produces a byte-identical output file - the AVX2 encoder is per-row
+A pruned-vocab table is a FRESH re-encode of the pruned source rows, never a row subset of a
+quantized table: the column scales are fit on the kept rows (not the full-vocab statistic),
+so the encoder must run on the pruned BF16 rows with the same (K, seed).
+Determinism: identical (source rows, K, seed,
+encoder, chunk_rows) produces a byte-identical output file - the AVX2 encoder is per-row
 deterministic and thread-count independent, the transform has no reductions, and the column
 scales accumulate in fp64 in row order (chunk_rows participates because it fixes the
 reduction tree).
@@ -48,10 +54,12 @@ tail-biting Viterbi (quantize_tiles_kernel.cuh two-pass scheme, parameterized ti
 
 from __future__ import annotations
 import glob
+import hashlib
 import json
 import math
 import os
 import platform
+import shutil
 import struct
 import threading
 import time
@@ -385,12 +393,43 @@ def compute_column_scales(source_rows_iter, D: int) -> torch.Tensor:
     return rms.clamp(min = 5.960464477539063e-8).to(torch.float16)
 
 
+def _keep_rows_sha256(keep_rows: torch.Tensor | None) -> str:
+    """Identity of the row filter, pinned in the file metadata: the lowercase hex sha256 of
+    the keep_rows list serialized as a JSON array of ints ("" when keep_rows is None)."""
+    if keep_rows is None:
+        return ""
+    return hashlib.sha256(json.dumps(keep_rows.tolist()).encode()).hexdigest()
+
+
+def _upgrade_legacy_header(path: str):
+    """One-time upgrade of a partial file written before keep_rows_sha256 existed: rewrite
+    the header with the field added (as "" - the field was introduced together with
+    keep_rows, so a file without it was necessarily written without a row filter) and
+    copy the data untouched (the header grows, so the file is rewritten once via a temp
+    file)."""
+    with open(path, "rb") as f:
+        hlen = struct.unpack("<Q", f.read(8))[0]
+        header = json.loads(f.read(hlen))
+    header["__metadata__"]["keep_rows_sha256"] = ""
+    hj = json.dumps(header, separators = (",", ":")).encode("utf-8")
+    hj += b" " * (-len(hj) % 8)
+    tmp = path + ".keeprows_upgrade.tmp"
+    with open(path, "rb") as src, open(tmp, "wb") as dst:
+        dst.write(struct.pack("<Q", len(hj)))
+        dst.write(hj)
+
+        src.seek(8 + hlen)   # skip the OLD header: copy only the data section
+        shutil.copyfileobj(src, dst)
+    os.replace(tmp, path)
+
+
 def quantize_trellis_table(
     source,
     out_path: str,
     K: int,
     seed: int = 0,
     key: str = DEFAULT_TENSOR_KEY,
+    keep_rows: torch.Tensor | None = None,
     chunk_rows: int = 8192,
     limit_rows: int | None = None,
     resume: bool = False,
@@ -402,7 +441,7 @@ def quantize_trellis_table(
     """
     Quantize a token-embedding table to the exl3_trellis_embed format. See the module
     docstring for the contract of this stable entry point (source = directory or rows
-    tensor). Returns a stats dict with
+    tensor, keep_rows row filter for pruned-vocab re-encodes). Returns a stats dict with
     rows/processed_rows/measured_rows/K/seed/encoder/rfn/sqnr_db/elapsed/bytes. The
     quantization quality (SQNR dB + rfn) is measured against the source rows over
     measured_rows encoded rows (all of them unless quality_sample limits the measurement).
@@ -431,6 +470,8 @@ def quantize_trellis_table(
                 self.key = "<tensor>"
             def read_rows(self, start, end):
                 return self.w[start:end]
+            def read_rows_indexed(self, idx):
+                return self.w[idx.to(self.w.device)]
         row_source = _RowsSource(w)
         src_D, src_name = row_source.D, "rows tensor"
     D = src_D
@@ -443,9 +484,37 @@ def quantize_trellis_table(
     base_key = row_source.key if row_source.key != "<tensor>" else key
     tensor_key = base_key.rsplit(".", 1)[0] if base_key.endswith(".weight") else base_key
 
-    total_out = row_source.num_rows
+
+    if keep_rows is not None:
+        keep_rows = keep_rows.to(torch.int64).reshape(-1)
+        total_out = keep_rows.shape[0]
+        assert bool((keep_rows < row_source.num_rows).all()) and bool((keep_rows >= 0).all()), \
+            "keep_rows contains out-of-bounds source row indices"
+    else:
+        total_out = row_source.num_rows
     if limit_rows is not None:
         total_out = min(total_out, limit_rows)
+
+    # ---------------------------------------------------------------- resume check
+    # the column scales were fit on the kept rows of the stored run, so a resume with a
+    # different row filter would silently reuse scales for the wrong rows; the filter's
+    # identity is pinned in the file metadata (a file written before this field existed
+    # carries no keep_rows)
+    keep_rows_sha = _keep_rows_sha256(keep_rows)
+    if resume and os.path.exists(out_path) and os.path.getsize(out_path) > 8:
+        with open(out_path, "rb") as f:
+            ex_hlen = struct.unpack("<Q", f.read(8))[0]
+            ex_meta = json.loads(f.read(ex_hlen)).get("__metadata__", {})
+        stored_sha = ex_meta.get("keep_rows_sha256", "")
+        if stored_sha != keep_rows_sha:
+            raise ValueError(
+                f"cannot resume {out_path}: the stored run used a different keep_rows row filter "
+                f"(stored keep_rows_sha256 {stored_sha!r} != current {keep_rows_sha!r}); "
+                f"start a fresh run without resume")
+        if "keep_rows_sha256" not in ex_meta:
+            # a legacy file has no field, hence no keep_rows: the stored sha is "" and
+            # the mismatch check above already passed, so the upgrade pins ""
+            _upgrade_legacy_header(out_path)
 
     if verbose:
         print(f" -- source table: {src_name} {row_source.num_rows} x {D} ({row_source.dtype if hasattr(row_source, 'dtype') else source.dtype}), "
@@ -453,6 +522,9 @@ def quantize_trellis_table(
         print(f" -- output tensors: {tensor_key}.weight_trellis, {tensor_key}.col_scales")
 
     # ---------------------------------------------------------------- column scales
+    # fit on ALL kept source rows, or reuse the partial file's on
+    # resume. Accumulated over the kept set in natural source-row order (sorted), so the
+    # statistic does not depend on the keep_rows permutation
     col_scales = read_table_tensor(out_path, f"{tensor_key}.col_scales", torch.float16) if resume else None
     if col_scales is None:
         if resume and os.path.exists(out_path):
@@ -465,8 +537,13 @@ def quantize_trellis_table(
                 f"(truncated or corrupt); start a fresh run without resume")
         t0 = time.time()
         def rows_iter():
-            for lo in range(0, row_source.num_rows, chunk_rows):
-                yield row_source.read_rows(lo, min(lo + chunk_rows, row_source.num_rows))
+            if keep_rows is None:
+                for lo in range(0, row_source.num_rows, chunk_rows):
+                    yield row_source.read_rows(lo, min(lo + chunk_rows, row_source.num_rows))
+            else:
+                kept = keep_rows.sort().values
+                for lo in range(0, kept.shape[0], chunk_rows):
+                    yield row_source.read_rows_indexed(kept[lo:lo + chunk_rows])
         col_scales = compute_column_scales(rows_iter(), D)
         if verbose:
             print(f" -- column scales fitted in {time.time() - t0:.0f} s")
@@ -490,6 +567,7 @@ def quantize_trellis_table(
             "transform": "qtip1",
             "rows": str(total_out),
             "hidden": str(D),
+            "keep_rows_sha256": keep_rows_sha,
         },
         resume = resume,
         chunk_rows = chunk_rows,
@@ -513,7 +591,18 @@ def quantize_trellis_table(
     enc_rows = 0
     for lo in range(start_row, total_out, chunk_rows):
         hi = min(lo + chunk_rows, total_out)
-        rows = row_source.read_rows(lo, hi)
+        if keep_rows is None:
+            rows = row_source.read_rows(lo, hi)
+        else:
+            # read_rows_indexed only coalesces strictly-consecutive indices: read the chunk
+            # in sorted order (long runs for lightly-pruned vocabularies), then reorder
+            # back to output order
+            sub = keep_rows[lo:hi]
+            order = torch.argsort(sub)
+            read = row_source.read_rows_indexed(sub[order])
+            inv = torch.empty_like(order)
+            inv[order] = torch.arange(order.numel())
+            rows = read[inv]
         w = torch.nan_to_num(rows.float(), nan = 0.0, posinf = 0.0, neginf = 0.0)
         out_ids = torch.arange(lo, hi, dtype = torch.int64)   # sign stream keys = OUTPUT rows
         y = forward_transform(w.to(dev), cs_f32_dev, seed, out_ids.to(dev)).cpu()

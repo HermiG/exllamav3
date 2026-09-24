@@ -1,5 +1,6 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))  # fork package must win over any installed copy
+import platform
 import shutil
 import tempfile
 import types
@@ -36,6 +37,20 @@ def _skip_no_cuda():
     not silently green on CPU-only CI); as a script, pass through to the caller's return."""
     if pytest is not None and __name__ != "__main__":
         pytest.skip("CUDA unavailable")
+
+
+
+def _skip_no_avx2():
+    """Tests that need SOME encoded table via the conversion engine's CPU AVX2 Viterbi
+    encoder (exllamav3.conversion.embed.encode_rows, JIT-compiled with -march=x86-64-v3):
+    real SKIP on non-x86-64 hosts (incl. CUDA-equipped ARM), where the encoder raises
+    instead of skipping. The platform check runs FIRST: skipping unconditionally under
+    pytest would drop these tests on every host, x86-64 included."""
+    if platform.machine() not in {"x86_64", "AMD64"}:
+        if pytest is not None and __name__ != "__main__":
+            pytest.skip("AVX2 x86-64 encoder host required")
+        return True
+    return False
 
 
 def _synth_table(N: int, D: int, K: int, seed: int, scale_rows: bool = True):
@@ -262,6 +277,8 @@ def test_fused_kernel_bit_exact_vs_codec():
     if not cuda:
         _skip_no_cuda()
         return
+    if _skip_no_avx2():
+        return
     from exllamav3.ext import exllamav3_ext as ext
     torch.manual_seed(5)
     N = 131
@@ -276,14 +293,16 @@ def test_fused_kernel_bit_exact_vs_codec():
                 ref = dequant_rows_transformed(packed[ids], cs, K, seed, D, G, row_ids = ids)
                 table = packed.pin_memory()
                 ptr = ext.trellis_embed_register(table)
-                out = torch.empty(ids.shape[0], D, dtype = torch.float32, device = dev)
-                # A8 (the aligned 8-byte K = 8 load) is gated on the table base AND (2G)/(2W) 8-alignment
-                # (trellis_embed.cu:414), so D = 512 routes every K - incl. load_codes_bits<8> - through the
-                # A8 = false window even though pin_memory() bases are 8-aligned; misaligned views land here too.
-                ext.trellis_embed_gather(ptr, mul1_codebook(dev), cs.float().to(dev),
-                                         ids.to(dev), K, seed, N, out)
-                assert torch.equal(out.cpu(), ref), f"fused kernel != codec at K = {K}, D = {D}, seed = {seed}"
-                ext.trellis_embed_unregister(table)
+                try:
+                    out = torch.empty(ids.shape[0], D, dtype = torch.float32, device = dev)
+                    # A8 (the aligned 8-byte K = 8 load) is gated on the table base AND (2G)/(2W) 8-alignment
+                    # (trellis_embed.cu:414), so D = 512 routes every K - incl. load_codes_bits<8> - through the
+                    # A8 = false window even though pin_memory() bases are 8-aligned; misaligned views land here too.
+                    ext.trellis_embed_gather(ptr, mul1_codebook(dev), cs.float().to(dev),
+                                             ids.to(dev), K, seed, N, out)
+                    assert torch.equal(out.cpu(), ref), f"fused kernel != codec at K = {K}, D = {D}, seed = {seed}"
+                finally:
+                    ext.trellis_embed_unregister(table)
 
 
 @torch.inference_mode()
@@ -317,6 +336,8 @@ def test_kernel_oob_id_clamped():
     oversized n_rows) must raise cleanly, with no sync and no launch."""
     if not cuda:
         _skip_no_cuda()
+        return
+    if _skip_no_avx2():
         return
     from exllamav3.ext import exllamav3_ext as ext
     N, D, K = 64, 512, 8
@@ -418,6 +439,8 @@ def test_converter_module_end_to_end():
     if not cuda:
         _skip_no_cuda()
         return
+    if _skip_no_avx2():
+        return
     from exllamav3.loader.safetensors import SafetensorsCollection as SafeTensors
     from exllamav3.conversion.embed import quantize_trellis_table, TrellisEmbedTableReader
     from exllamav3.modules.embedding import Embedding
@@ -474,10 +497,14 @@ def test_converter_module_end_to_end():
 
 
 @torch.inference_mode()
-def test_converter_resume():
-    """Resume continues an interrupted run (validated against the partial header) and
-    produces a table bit-identical to the uninterrupted run."""
-    from exllamav3.conversion.embed import quantize_trellis_table
+def test_converter_resume_and_keep_rows():
+    """Resume on a COMPLETE table is a no-op (re-validates the header parameters, writes
+    nothing) and mismatched parameters are rejected; keep_rows re-maps rows to output
+    order with scales fitted over the kept set. (Interrupted-run resume with bit-identical
+    completion is covered by test_converter_legacy_header_upgrade.)"""
+    from exllamav3.conversion.embed import quantize_trellis_table, TrellisEmbedTableReader
+    if _skip_no_avx2():
+        return
 
     torch.manual_seed(17)
     V, D, K = 128, 1024, 6
@@ -490,12 +517,10 @@ def test_converter_resume():
         full = os.path.join(d, "full.safetensors")
         quantize_trellis_table(d, full, K = K, seed = 3, key = key, chunk_rows = 32,
                                devices = [0], verbose = False)
-        # simulate interruption: first pass writes only 2 chunks, then resume
-        part = os.path.join(d, "part.safetensors")
-        # limit_rows cuts the run short -> header records the SHORT table, so interruption
-        # must come from the writer level: emulate by killing after chunk via limit then
-        # resuming the full table is not possible; instead validate resume on the complete
-        # file is a no-op and mismatched params are rejected
+        # resume on the complete file: the writer-level interruption path cannot be
+        # simulated here (limit_rows records a SHORT table), so assert the no-op resume
+        # and the mismatched-parameter rejection; interrupted resume itself is covered
+        # by test_converter_legacy_header_upgrade
         stats = quantize_trellis_table(d, full, K = K, seed = 3, key = key, chunk_rows = 32,
                                        devices = [0], resume = True, verbose = False)
         assert stats["processed_rows"] == 0   # already complete
@@ -505,8 +530,317 @@ def test_converter_resume():
             raise AssertionError("resume with mismatched K was not rejected")
         except ValueError as e:
             assert "resume" in str(e).lower()
+
+        # keep_rows: output row n = source row keep_rows[n]; scales over kept set
+        keep = torch.tensor([5, 0, 127, 64, 64, 3], dtype = torch.int64)
+        kp = os.path.join(d, "keep.safetensors")
+        quantize_trellis_table(d, kp, K = K, seed = 3, key = key, keep_rows = keep,
+                               chunk_rows = 2, devices = [0], verbose = False)
+        rd = TrellisEmbedTableReader(kp)
+        assert rd.num_rows == keep.shape[0]
+        deq = rd.dequant(torch.arange(keep.shape[0]))
+        # output row n = source row keep[n]: rows 3 and 4 share source row 64 (distinct
+        # sign-stream keys, since the key is the OUTPUT id, so they are encoded differently
+        # but must both reconstruct their source within the K = 6 noise floor
+        assert ((deq[3] - rows[64]).norm() / rows[64].norm() < 0.03).item()
+        assert ((deq[4] - rows[64]).norm() / rows[64].norm() < 0.03).item()
+        assert ((deq[0] - rows[5]).norm() / rows[5].norm() < 0.03).item()
+        assert ((deq[2] - rows[127]).norm() / rows[127].norm() < 0.03).item()
+        rd.close()
     finally:
         shutil.rmtree(d, ignore_errors = True)
+
+@torch.inference_mode()
+def test_converter_keep_rows_resume_rejection():
+    """Resuming with a DIFFERENT keep_rows row filter must be rejected (the stored
+    column scales were fit on the stored run's kept rows): the filter's identity is
+    pinned in the file metadata (keep_rows_sha256). The same filter resumes cleanly."""
+    from exllamav3.conversion.embed import quantize_trellis_table
+    if _skip_no_avx2():
+        return
+    torch.manual_seed(31)
+    V, D, K = 128, 1024, 6
+    key = "model.embed_tokens.weight"
+    rows = torch.randn(V, D)
+    d = tempfile.mkdtemp(prefix = "trellis_keepres_")
+    try:
+        _write_source_table(os.path.join(d, "src.safetensors"), key, rows)
+        out = os.path.join(d, "keep.safetensors")
+        keep_a = torch.tensor([0, 1, 2, 3], dtype = torch.int64)
+        quantize_trellis_table(d, out, K = K, seed = 3, key = key, keep_rows = keep_a,
+                               chunk_rows = 2, devices = [0], verbose = False)
+        keep_b = torch.tensor([0, 1, 2, 4], dtype = torch.int64)
+        try:
+            quantize_trellis_table(d, out, K = K, seed = 3, key = key, keep_rows = keep_b,
+                                   chunk_rows = 2, devices = [0], resume = True, verbose = False)
+            raise AssertionError("resume with a different keep_rows filter was not rejected")
+        except ValueError as e:
+            assert "keep_rows" in str(e)
+        # same filter: resume is accepted (no-op on the complete file)
+        stats = quantize_trellis_table(d, out, K = K, seed = 3, key = key, keep_rows = keep_a,
+                                       chunk_rows = 2, devices = [0], resume = True, verbose = False)
+        assert stats["processed_rows"] == 0
+    finally:
+        shutil.rmtree(d, ignore_errors = True)
+
+
+def test_converter_legacy_header_upgrade():
+    """An interrupted run written before keep_rows_sha256 existed (field absent from the
+    header) must be upgraded in place on resume - data section untouched - and finish
+    byte-identical to a fresh uninterrupted run (determinism: same rows + K/seed)."""
+    import json
+    import struct
+    from exllamav3.conversion.embed import quantize_trellis_table
+    if _skip_no_avx2():
+        return
+
+    torch.manual_seed(23)
+    V, D, K = 128, 1024, 6
+    key = "model.embed_tokens.weight"
+    rows = torch.randn(V, D)
+    d = tempfile.mkdtemp(prefix = "trellis_legacy_")
+    try:
+        _write_source_table(os.path.join(d, "src.safetensors"), key, rows)
+
+        fresh = os.path.join(d, "fresh.safetensors")
+        quantize_trellis_table(d, fresh, K = K, seed = 3, key = key, chunk_rows = 32,
+                               devices = [0], verbose = False)
+        fresh_bytes = open(fresh, "rb").read()
+
+        # simulate an interrupted pre-field run: strip the field from the header and cut
+        # the stream to one complete chunk (the small col_scales tensor stays intact)
+        part = os.path.join(d, "part.safetensors")
+        quantize_trellis_table(d, part, K = K, seed = 3, key = key, chunk_rows = 32,
+                               devices = [0], verbose = False)
+        with open(part, "rb") as f:
+            hlen = struct.unpack("<Q", f.read(8))[0]
+            header = json.loads(f.read(hlen))
+            data = f.read()
+        del header["__metadata__"]["keep_rows_sha256"]
+        hj = json.dumps(header, separators = (",", ":")).encode("utf-8")
+        hj += b" " * (-len(hj) % 8)
+        # Layout coupling to StreamingSafetensorsWriter (conversion/ngram.py, same writer
+        # the engine uses): 8-byte LE header length + JSON header padded to a multiple of
+        # 8; the data section starts at 8 + hlen with the small tensors first (col_scales
+        # = D * 2 bytes) and the stream rows (row_bytes each) behind them. If the writer
+        # layout ever changes, this slice must change with it.
+        G = D // 256
+        row_bytes = (G + D * K // 16) * 2
+        with open(part, "wb") as f:
+            f.write(struct.pack("<Q", len(hj)))
+            f.write(hj)
+            f.write(data[: D * 2 + 32 * row_bytes])
+
+        stats = quantize_trellis_table(d, part, K = K, seed = 3, key = key, chunk_rows = 32,
+                                       devices = [0], resume = True, verbose = False)
+        assert stats["processed_rows"] == V - 32
+        resumed_bytes = open(part, "rb").read()
+        assert resumed_bytes == fresh_bytes, "resumed legacy run != fresh run"
+        hlen = struct.unpack("<Q", resumed_bytes[:8])[0]
+        meta = json.loads(resumed_bytes[8:8 + hlen])["__metadata__"]
+        assert meta["keep_rows_sha256"] == ""
+    finally:
+        shutil.rmtree(d, ignore_errors = True)
+
+
+def _cpu_trellis_module(V: int, D: int, K: int, seed: int):
+    """Embedding module with a synthetic trellis table loaded through the real load() path,
+    forced onto the CPU fallback branch (dev=None) by mocking torch.cuda.is_available;
+    returns (module, packed, col_scales). No safetensors file or conversion engine needed."""
+    from exllamav3.modules.embedding import Embedding
+    key = "model.embed_tokens"
+    _, packed, cs = _synth_table(V, D, K, seed)
+    G = D // GROUP
+    meta = {"format": et.FORMAT, "version": et.FORMAT_VERSION, "codebook": "mul1",
+            "transform": "qtip1", "K": K, "G": G, "seed": seed, "rows": V, "hidden": D}
+    tensors = {key + ".weight_trellis": packed, key + ".col_scales": cs}
+    stc = types.SimpleNamespace(
+        tensor_file_map = {k: "f" for k in tensors},
+        file_headers = {"f": {"__metadata__": meta}},
+        has_tensor = lambda k: k in tensors,
+        get_tensor = lambda k, device, **kw: tensors[k].to(device),
+    )
+    stc.find_stc = lambda k: stc   # owning-collection hop used by _load_trellis
+    module = Embedding(config = types.SimpleNamespace(stc = stc), key = key,
+                       vocab_size = V, hidden_size = D, out_dtype = torch.float32)
+    with mock.patch("torch.cuda.is_available", return_value = False):
+        module.load(torch.device("cpu"))
+    assert module.trellis is not None and module.trellis["dev"] is None
+    return module, packed, cs
+
+
+@torch.inference_mode()
+def test_module_cpu_fallback_forward():
+    """CPU fallback (dev=None): forward must decode rows with the torch reference codec,
+    bit-exact with dequant_rows_transformed of the same packed table."""
+    if _skip_no_avx2():
+        return
+    V, D, K, seed = 32, 512, 8, 42
+    G = D // GROUP
+    module, packed, cs = _cpu_trellis_module(V, D, K, seed)
+    try:
+        ids = torch.tensor([0, 3, 7, 7, 12, 31])
+        x = module.forward(ids, {})
+        assert x.shape == (6, D) and x.dtype == torch.float32
+        ref = dequant_rows_transformed(packed[ids], cs, K, seed, D, G, row_ids = ids)
+        assert torch.equal(x, ref), "CPU fallback forward != reference decode"
+    finally:
+        module.unload()
+
+
+@torch.inference_mode()
+def test_module_mm_indexed_forward():
+    """MM/indexed forward: standard positions (ids < FIRST_MM_EMBEDDING_INDEX) must be
+    filled by the trellis _gather and indexed positions by the external embeddings, in
+    one combined output."""
+    if _skip_no_avx2():
+        return
+    from exllamav3.tokenizer.mm_embedding import FIRST_MM_EMBEDDING_INDEX
+    V, D, K, seed = 32, 512, 8, 42
+    G = D // GROUP
+    module, packed, cs = _cpu_trellis_module(V, D, K, seed)
+    try:
+        mm_emb = torch.randn(2, D)
+        ie = types.SimpleNamespace(first_index = FIRST_MM_EMBEDDING_INDEX, mm_length = 2,
+                                   deepstack_embeddings = None, embeddings = mm_emb)
+        mm0 = FIRST_MM_EMBEDDING_INDEX
+        ids = torch.tensor([[0, 1, mm0, mm0 + 1, 3],
+                            [5, mm0 + 1, 9, 9, 31]])
+        x = module.forward(ids, {"indexed_embeddings": [ie]})
+        assert x.shape == (2, 5, D) and x.dtype == torch.float32
+        for i in range(2):
+            sm = ids[i] < mm0
+            im = (ids[i] >= mm0) & (ids[i] < mm0 + 2)
+            assert bool(sm.any()) and bool(im.any())
+            std_ids = ids[i][sm]
+            exp = dequant_rows_transformed(packed[std_ids], cs, K, seed, D, G, row_ids = std_ids)
+            assert torch.equal(x[i][sm], exp), f"MM forward row {i}: standard gather mismatch"
+            assert torch.equal(x[i][im], mm_emb[ids[i][im] - mm0]), \
+                f"MM forward row {i}: indexed fill mismatch"
+    finally:
+        module.unload()
+
+
+@torch.inference_mode()
+def test_module_oob_id_contract():
+    """Current (deliberately relaxed) OOB-id contract: a loud IndexError only when the
+    ids are HOST-resident (checked before the H2D copy - both the CPU fallback and the
+    CUDA branch); ids that arrive already on the compute device skip the check and the
+    kernel clamps them to the last row (bit-identical to row N-1). The kernel-level
+    clamp itself is pinned by test_kernel_oob_id_clamped."""
+    if not cuda:
+        _skip_no_cuda()
+        return
+    if _skip_no_avx2():
+        return
+    from exllamav3.loader.safetensors import SafetensorsCollection as SafeTensors
+    from exllamav3.conversion.embed import quantize_trellis_table
+    from exllamav3.modules.embedding import Embedding
+
+    torch.manual_seed(29)
+    V, D, K, seed = 64, 512, 8, 5
+    key = "model.embed_tokens.weight"
+    rows = torch.randn(V, D)
+    d = tempfile.mkdtemp(prefix = "trellis_oob_")
+    try:
+        _write_source_table(os.path.join(d, "src.safetensors"), key, rows)
+        out_file = os.path.join(d, "embedding-trellis.safetensors")
+        quantize_trellis_table(d, out_file, K = K, seed = seed, key = key,
+                               chunk_rows = 16, devices = [0], verbose = False)
+        stc = SafeTensors(d, load_method = "python")
+        module = Embedding(config = types.SimpleNamespace(stc = stc), key = key.rsplit(".", 1)[0],
+                           vocab_size = V, hidden_size = D, out_dtype = torch.float32)
+        module.load(torch.device("cpu"), compute_device = torch.device(dev))
+        try:
+            # host-resident OOB id: loud IndexError on the CUDA branch (before the H2D copy)
+            if pytest is not None:
+                with pytest.raises(IndexError, match = "out of range"):
+                    module.forward(torch.tensor([V]), {})
+            # already-on-device OOB id: no check, the kernel clamps to the last row
+            oob = module.forward(torch.tensor([V], device = dev), {})
+            ref = module.forward(torch.tensor([V - 1], device = dev), {})
+            assert torch.equal(oob, ref), "cuda-resident OOB id must clamp to the last row"
+        finally:
+            module.unload()
+
+        # CPU fallback branch: host-resident OOB id is loud as well
+        module2, _, _ = _cpu_trellis_module(32, 512, 8, 42)
+        try:
+            if pytest is not None:
+                with pytest.raises(IndexError, match = "out of range"):
+                    module2.forward(torch.tensor([32]), {})
+        finally:
+            module2.unload()
+    finally:
+        shutil.rmtree(d, ignore_errors = True)
+
+
+@torch.inference_mode()
+def test_module_retarget_trellis():
+    """retarget_trellis: a same-device retarget is a no-op (stable table_ptr, dev
+    unchanged); with >= 2 GPUs the registration moves to the new device and the gather
+    stays bit-exact with the reference decode there."""
+    if not cuda:
+        _skip_no_cuda()
+        return
+    if _skip_no_avx2():
+        return
+    from exllamav3.loader.safetensors import SafetensorsCollection as SafeTensors
+    from exllamav3.conversion.embed import quantize_trellis_table
+    from exllamav3.modules.embedding import Embedding
+
+    torch.manual_seed(37)
+    V, D, K, seed = 64, 512, 8, 11
+    key = "model.embed_tokens.weight"
+    rows = torch.randn(V, D)
+    d = tempfile.mkdtemp(prefix = "trellis_retarget_")
+    try:
+        _write_source_table(os.path.join(d, "src.safetensors"), key, rows)
+        out_file = os.path.join(d, "embedding-trellis.safetensors")
+        quantize_trellis_table(d, out_file, K = K, seed = seed, key = key,
+                               chunk_rows = 16, devices = [0], verbose = False)
+        stc = SafeTensors(d, load_method = "python")
+        module = Embedding(config = types.SimpleNamespace(stc = stc), key = key.rsplit(".", 1)[0],
+                           vocab_size = V, hidden_size = D, out_dtype = torch.float32)
+        module.load(torch.device("cpu"), compute_device = torch.device(dev))
+        try:
+            # same device: no-op, stable alias
+            p0 = module.trellis["table_ptr"]
+            module.retarget_trellis(torch.device(dev))
+            assert module.trellis["table_ptr"] == p0
+            assert module.trellis["dev"] == torch.device(dev)
+            if torch.cuda.device_count() >= 2:
+                dev2 = torch.device("cuda:1")
+                module.retarget_trellis(dev2)
+                assert module.trellis["dev"] == dev2
+                assert module.trellis["table_ptr"] != p0
+                ids = torch.tensor([0, 1, V - 1], dtype = torch.int64)
+                x = module.forward(ids, {})
+                assert x.device == dev2
+                ref = dequant_rows_transformed(module.trellis["table"][ids],
+                                               module.trellis["col_scales"], K, seed, D,
+                                               D // GROUP, row_ids = ids)
+                assert torch.equal(x.cpu(), ref), "retargeted gather != reference decode"
+        finally:
+            module.unload()
+    finally:
+        shutil.rmtree(d, ignore_errors = True)
+
+
+@torch.inference_mode()
+def test_tp_export_rejects_trellis():
+    """tp_export must refuse a trellis-quantized embedding (no TP plan exists for the
+    device-mapped host table)."""
+    from exllamav3.modules.embedding import Embedding
+    module = Embedding(config = None, key = "model.embed_tokens", vocab_size = 32,
+                       hidden_size = 512)
+    module.device = torch.device("cpu")
+    module.trellis = {"table_ptr": None}
+    try:
+        module.tp_export(None, None)
+        raise AssertionError("tp_export did not reject a trellis embedding")
+    except AssertionError as e:
+        assert "tensor parallelism" in str(e)
 
 
 if __name__ == "__main__":

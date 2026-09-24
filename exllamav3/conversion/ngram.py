@@ -153,7 +153,12 @@ class StreamingSafetensorsWriter:
             with open(path, "rb") as f:
                 ex_hlen = struct.unpack("<Q", f.read(8))[0]
                 ex_hj = f.read(ex_hlen)
-            if ex_hj != hj:
+            # parsed-JSON compare, not byte compare: the header's meaning is the parsed
+            # dict, and byte equality would additionally depend on the __metadata__ key
+            # order (a legacy file upgraded by conversion/embed._upgrade_legacy_header
+            # keeps the legacy key order - byte equality would fail an otherwise valid
+            # resume once the metadata dict order ever changes)
+            if json.loads(ex_hj) != json.loads(hj):
                 raise ValueError(
                     f"cannot resume {path}: existing header does not match this run's parameters")
             done = max(0, os.path.getsize(path) - stream_abs)
