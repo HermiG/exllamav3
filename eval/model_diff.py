@@ -160,11 +160,13 @@ def main(args):
 
         # Load modules
         config_a.stc.begin_deferred_load()
-        module_a.load(device if not module_a.caps.get("prefer_cpu") else "cpu")
+        module_a.load(torch.device("cpu") if module_a.caps.get("prefer_cpu") else device,
+                      compute_device = device)
         config_a.stc.end_deferred_load()
 
         config_b.stc.begin_deferred_load()
-        module_b.load(device if not module_b.caps.get("prefer_cpu") else "cpu")
+        module_b.load(torch.device("cpu") if module_b.caps.get("prefer_cpu") else device,
+                      compute_device = device)
         config_b.stc.end_deferred_load()
 
         # Error measures
@@ -228,8 +230,15 @@ def main(args):
                 for j in range(rows):
                     # Hyperconnection models carry the residual as (seq, streams, hidden): compare
                     # the streams flattened to rows, the Frobenius norm needs 2D
-                    sa = state_a[j].reshape(-1, state_a.shape[-1]).to(float)
-                    sb = state_b[j].reshape(-1, state_b.shape[-1]).to(float)
+                    # A trellis embedding gathers onto the compute device while a non-trellis
+                    # prefer_cpu embedding stays on CPU; align the operands to the CUDA one
+                    # (the cheaper copy direction: one fp64 H2D upload of the CPU side, not a
+                    # GPU fp64 materialization plus per-row D2H copies in the loop below)
+                    sa = state_a[j].reshape(-1, state_a.shape[-1])
+                    sb = state_b[j].reshape(-1, state_b.shape[-1])
+                    tgt = sa.device if sa.device.type == "cuda" else sb.device
+                    sa = sa.to(tgt, float)
+                    sb = sb.to(tgt, float)
                     cos_error_sum += cosine_error(sa, sb)
                     sqnr_sum += sqnr(sa, sb)
                     sa -= sb
