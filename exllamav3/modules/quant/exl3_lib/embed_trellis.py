@@ -271,7 +271,11 @@ def group_prescale(w: torch.Tensor, K: int, group: int = GROUP) -> tuple[torch.T
         scale0   = clamp(rms / cs_row, 1e-8).to(fp16), where(>0, scale0, 1.0)
         w_pre    = w / scale0
 
-    The fp16 scale0 values ARE the stored G scale words (no LS refit). Returns
+    The fp16 scale0 values are the stored G scale words at this level (this function
+    works in transformed space and cannot refit against the source rows); the conversion
+    engine (conversion/embed.py) applies the ngram-style least-squares refit in source
+    space after encoding - the decode is linear in the scale word, so the refit strictly
+    minimizes the per-group source-space squared error. Returns
     (w_pre (N, D) fp32 contiguous, scale0 (N, G) fp16).
     """
     # group_prescale uses the module-level CS_HEURISTIC/CS_MIN
@@ -296,9 +300,21 @@ def quantize_rows_grouped(w: torch.Tensor, K: int, D: int, encode_fn,
     per-group pre-scale (group_prescale), Viterbi search through encode_fn(w_pre, K, D) ->
     states (N, D), and pack_rows with the fp16 pre-scales as the stored scale words.
     Returns (packed (N, G + D*K/16) int16, scale0 (N, G) fp16).
+
+    All-zero source rows (vocab pad slots) pack to all-zero words deterministically,
+    bypassing the encoder: group_prescale's where(scale0 > 0, scale0, 1.0) guard would
+    otherwise store a 1.0 scale for the empty groups and the Viterbi pass would emit
+    codebook garbage for them (max |dequant| ~55 measured). The contract requires pad
+    rows to dequant to exactly 0.0 (zero scale words -> zero output regardless of
+    codes or sign stream).
     """
     w = torch.nan_to_num(w.float(), nan = 0.0, posinf = 0.0, neginf = 0.0)
     w_pre, scale0 = group_prescale(w, K, group)
     states = encode_fn(w_pre, K, D)
     packed = pack_rows(states.to(torch.int64), scale0, K, D, D // group)
+    zero_rows = (w == 0).all(dim = 1)
+    if zero_rows.any():
+        packed[zero_rows] = 0
+        scale0 = scale0.clone()
+        scale0[zero_rows] = 0
     return packed, scale0

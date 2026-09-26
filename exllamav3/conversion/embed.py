@@ -8,7 +8,10 @@ per-256-column-group fp16 pre-scales followed by the D*K-bit tail-biting ring bi
 kernel). The table is quantized in the QTIP-transformed space: column scales (per-column RMS
 over ALL rows, fp16) -> per-element signs from a seeded LCG keyed by the table row id ->
 256-D Sylvester Hadamard groups, then per-group pre-scale + trellis VQ (the ring spans the
-full row; the fp16 pre-scales ARE the stored scale words).
+full row; the fp16 pre-scales are LS-refit against the source rows after encoding and the
+refit values are the stored scale words (ngram quantize_rows parity: the decode is linear
+in the scale word, so the refit strictly minimizes the per-group source-space squared
+error).
 
 PROGRAMMATIC ENTRY POINT (stable signature; external tooling - e.g. vocab-prune suites -
 imports this and never re-implements the encoder or codec):
@@ -497,6 +500,7 @@ def quantize_trellis_table(
 
     dev = f"cuda:{devices[0]}" if devices and torch.cuda.is_available() else "cpu"
     cs_f32_dev = col_scales.float().to(dev)
+    cb = mul1_codebook("cpu")   # unit-scale decode LUT for the LS scale-word refit
     # quality (SQNR/rfn) is measured on the decoder output vs the source rows; a sample
     # (deterministic generator seed 0) limits the measured rows without touching the encode
     # (only the sampled rows are decoded: the chain is row-independent, so the sampled
@@ -516,6 +520,19 @@ def quantize_trellis_table(
         packed, _ = quantize_rows_grouped(y, K, D,
                                           lambda wp, KK, DD: encode_rows(wp, KK, DD, threads),
                                           group = GROUP)
+        # LS refit of the stored per-group scale words (ngram quantize_rows parity, per
+        # 256-column group): decode the chunk with unit scale words and fit
+        # s* = (w·q)/(q·q) in source space. The decode is linear in the scale word
+        # (butterfly, signs and column scales are all linear), so s* strictly minimizes
+        # the per-group source-space squared error - the heuristic pre-scale scale0 is
+        # just another candidate s (measured +0.01..+0.02 dB SQNR on real tables).
+        # Zero rows refit to exactly 0 (numerator 0), preserving the pad-row contract.
+        states, _ = unpack_rows(packed, K, D, G)
+        q = cb[states].float()
+        q = ((hadamard_butterfly(q, D) * (1.0 / 16.0)) * lcg_signs(out_ids, D, seed)) * col_scales.float()
+        s_star = ((w.view(hi - lo, G, GROUP) * q.view(hi - lo, G, GROUP)).sum(2)
+                  / q.view(hi - lo, G, GROUP).square().sum(2).clamp(min = 1e-12))
+        packed = pack_rows(states.to(torch.int64), s_star.to(torch.float16), K, D, G)
         writer.write_chunk(packed)
         if quality_sample == 0:
             pass
